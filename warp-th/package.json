@@ -1,0 +1,19 @@
+{
+  "name": "warp-th",
+  "version": "1.0.0",
+  "description": "A TypeScript project",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "git": "git add . && git commit -m \"${npm_config_m:-auto commit $(date)}\" && git push"
+  },
+  "keywords": [],
+  "author": "Sam Meydanshahi",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^4.0.0",
+    "ts-node": "^10.0.0"
+  }
+}
