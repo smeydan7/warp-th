@@ -12,14 +12,10 @@ import {
   ManualCondition
 } from './types';
 
-// Generic database interface definition matching standard pooling library wrappers
 export interface IDatabase {
   query: <T = any>(text: string, params?: any[]) => Promise<T[]>;
 }
 
-/**
- * Derives fractional years of service relative to the target temporal execution context
- */
 export function getTenureYears(hireDate: string): number {
   const hire = new Date(hireDate);
   const now = new Date();
@@ -27,9 +23,6 @@ export function getTenureYears(hireDate: string): number {
   return diffInMs / (1000 * 60 * 60 * 24 * 365.25);
 }
 
-/**
- * Asserts engine execution viability across rule-variants against employee records
- */
 export async function matchesRule(
   db: IDatabase, 
   employee: Employee, 
@@ -45,20 +38,17 @@ export async function matchesRule(
         return empValue === value;
       });
     }
-
     case 'location': {
       const locCond = cond as LocationCondition;
       if (locCond.work_state && locCond.work_state !== employee.work_state) return false;
       if (locCond.work_country && locCond.work_country !== employee.work_country) return false;
       return true;
     }
-
     case 'tenure': {
       const tenureCond = cond as TenureCondition;
       const actualTenure = getTenureYears(employee.hire_date);
       return actualTenure >= tenureCond.tenure_years_gte;
     }
-
     case 'group': {
       const groupCond = cond as GroupCondition;
       const rows = await db.query<{ count: string }>(
@@ -70,20 +60,15 @@ export async function matchesRule(
       );
       return Number(rows[0]?.count || 0) > 0;
     }
-
     case 'manual': {
       const manualCond = cond as ManualCondition;
       return manualCond.employee_id === employee.id;
     }
-
     default:
       return false;
   }
 }
 
-/**
- * Pulls, evaluates, and prioritizes rule variations applicable to target configurations
- */
 export async function getCandidateRules(
   db: IDatabase, 
   employeeId: string, 
@@ -105,7 +90,6 @@ export async function getCandidateRules(
     }
   }
 
-  // Deterministic prioritization sorting: Higher priority wins. Tie-break via oldest creation timestamp.
   return matchedRules.sort((a, b) => {
     if (b.priority !== a.priority) {
       return b.priority - a.priority;
@@ -115,7 +99,8 @@ export async function getCandidateRules(
 }
 
 /**
- * Reconciles engine assignments with backing system storage states
+ * Reconciles engine assignments with backing system storage states,
+ * using clear date ranges for state changes.
  */
 export async function resolveAssignment(
   db: IDatabase, 
@@ -129,7 +114,6 @@ export async function resolveAssignment(
   const candidates = await getCandidateRules(db, employeeId, assignableTypeId);
   const todayStr = new Date().toISOString().split('T')[0];
 
-  // Pull existing active assignments
   const currentActive = await db.query<Assignment>(
     'SELECT * FROM assignments WHERE employee_id = $1 AND assignable_type_id = $2 AND effective_to IS NULL',
     [employeeId, assignableTypeId]
@@ -140,7 +124,6 @@ export async function resolveAssignment(
     const targetAssignment = currentActive[0] || null;
 
     if (!winningRule) {
-      // No active matches: close out pre-existing slots if active
       if (targetAssignment) {
         await db.query('UPDATE assignments SET effective_to = $1, updated_at = now() WHERE id = $2', [todayStr, targetAssignment.id]);
         await logAudit(db, targetAssignment.id, 'REMOVE', 'No matching rules remain.', null, candidates);
@@ -148,23 +131,27 @@ export async function resolveAssignment(
       return;
     }
 
-    // If target has drifted, invalidate the outdated match and provision the new entry
-    if (!targetAssignment || targetAssignment.target_id !== winningRule.target_id) {
-      if (targetAssignment) {
-        await db.query('UPDATE assignments SET effective_to = $1, updated_at = now() WHERE id = $2', [todayStr, targetAssignment.id]);
-        await logAudit(db, targetAssignment.id, 'SUPERSEDE', `Superseded by rule ${winningRule.id}`, winningRule.id, candidates);
-      }
-
-      const newAssignmentId = crypto.randomUUID();
-      await db.query(
-        `INSERT INTO assignments (id, employee_id, assignable_type_id, target_id, source, rule_id, effective_from, effective_to)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)`,
-        [newAssignmentId, employeeId, assignableTypeId, winningRule.target_id, winningRule.rule_type === 'manual' ? 'manual' : 'rule', winningRule.id, todayStr]
-      );
-      await logAudit(db, newAssignmentId, 'ADD', `Assigned via rule ${winningRule.id}`, winningRule.id, candidates);
+    // Optimization: Skip processing if the assigned target is already correct
+    if (targetAssignment && targetAssignment.target_id === winningRule.target_id) {
+      return;
     }
+
+    // Process target changes: end the current period and start a new one
+    if (targetAssignment) {
+      await db.query('UPDATE assignments SET effective_to = $1, updated_at = now() WHERE id = $2', [todayStr, targetAssignment.id]);
+      await logAudit(db, targetAssignment.id, 'SUPERSEDE', `Superseded by rule ${winningRule.id}`, winningRule.id, candidates);
+    }
+
+    const newAssignmentId = crypto.randomUUID();
+    await db.query(
+      `INSERT INTO assignments (id, employee_id, assignable_type_id, target_id, source, rule_id, effective_from, effective_to)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)`,
+      [newAssignmentId, employeeId, assignableTypeId, winningRule.target_id, winningRule.rule_type === 'manual' ? 'manual' : 'rule', winningRule.id, todayStr]
+    );
+    await logAudit(db, newAssignmentId, 'ADD', `Assigned via rule ${winningRule.id}`, winningRule.id, candidates);
+
   } else {
-    // Multi-cardinality resolution: compute target set and execute state diffing
+    // Multi-cardinality resolution: apply changes only where sets differ
     const targetToRuleMap = new Map<string, AssignmentRule>();
     candidates.forEach(rule => {
       if (!targetToRuleMap.has(rule.target_id)) {
@@ -175,7 +162,7 @@ export async function resolveAssignment(
     const targetSet = new Set(targetToRuleMap.keys());
     const currentTargetMap = new Map<string, Assignment>(currentActive.map(a => [a.target_id, a]));
 
-    // 1. Terminate dropped entries
+    // 1. Terminate assignments no longer required by the rules
     for (const [targetId, assignment] of currentTargetMap.entries()) {
       if (!targetSet.has(targetId)) {
         await db.query('UPDATE assignments SET effective_to = $1, updated_at = now() WHERE id = $2', [todayStr, assignment.id]);
@@ -183,7 +170,7 @@ export async function resolveAssignment(
       }
     }
 
-    // 2. Introduce untracked entries
+    // 2. Add new assignments missing from current active list
     for (const targetId of targetSet.keys()) {
       if (!currentTargetMap.has(targetId)) {
         const winningRule = targetToRuleMap.get(targetId)!;
@@ -199,9 +186,6 @@ export async function resolveAssignment(
   }
 }
 
-/**
- * Batches calculations across the entire company assignable registry for an individual employee
- */
 export async function resolveAllForEmployee(db: IDatabase, employeeId: string): Promise<void> {
   const empRows = await db.query<Employee>('SELECT company_id FROM employees WHERE id = $1', [employeeId]);
   if (empRows.length === 0) return;
@@ -213,9 +197,6 @@ export async function resolveAllForEmployee(db: IDatabase, employeeId: string): 
   }
 }
 
-/**
- * Writes records to the audit log tracking structural pipeline adjustments
- */
 async function logAudit(
   db: IDatabase, 
   assignmentId: string, 

@@ -1,12 +1,12 @@
 import { IDatabase, resolveAllForEmployee } from './resolver';
+import { onEmployeeUpdated, onGroupMembershipChanged } from './events';
 
 class CompleteMockDatabaseClient implements IDatabase {
   public assignments: any[] = [];
   public auditLogs: any[] = [];
 
-  // 100% Mirror of seed.sql records (Context Year: 2026)
-  private employees = [
-    { id: 'e0000000-0000-0000-0000-000000000001', company_id: 'c0000000-0000-0000-0000-000000000000', first_name: 'Eng Lead', last_name: 'Lead', email: 'eng.lead@warp.inc', employment_type: 'w2_employee', pay_type: 'salary', department: 'Engineering', title: 'Engineering Lead', work_state: 'CA', work_country: 'US', hire_date: '2021-07-12', status: 'active' },
+  public employees = [
+    { id: 'e0000000-0000-0000-0000-000000000001', company_id: 'c0000000-0000-0000-0000-000000000000', first_name: 'Eng', last_name: 'Lead', email: 'eng.lead@warp.inc', employment_type: 'w2_employee', pay_type: 'salary', department: 'Engineering', title: 'Engineering Lead', work_state: 'CA', work_country: 'US', hire_date: '2021-07-12', status: 'active' },
     { id: 'e0000000-0000-0000-0000-000000000002', company_id: 'c0000000-0000-0000-0000-000000000000', first_name: 'Alice', last_name: 'Smith', email: 'alice@warp.inc', employment_type: 'w2_employee', pay_type: 'salary', department: 'Engineering', title: 'Software Engineer', work_state: 'CA', work_country: 'US', hire_date: '2023-07-12', status: 'active' },
     { id: 'e0000000-0000-0000-0000-000000000003', company_id: 'c0000000-0000-0000-0000-000000000000', first_name: 'Bob', last_name: 'Jones', email: 'bob@warp.inc', employment_type: 'w2_employee', pay_type: 'salary', department: 'Engineering', title: 'Software Engineer', work_state: 'NY', work_country: 'US', hire_date: '2026-01-12', status: 'active' },
     { id: 'e0000000-0000-0000-0000-000000000004', company_id: 'c0000000-0000-0000-0000-000000000000', first_name: 'Carol', last_name: 'Davis', email: 'carol@warp.inc', employment_type: 'w2_employee', pay_type: 'hourly', department: 'Sales', title: 'Account Executive', work_state: 'NY', work_country: 'US', hire_date: '2025-07-12', status: 'active' },
@@ -21,10 +21,10 @@ class CompleteMockDatabaseClient implements IDatabase {
     { id: 'a0000000-0000-0000-0000-000000000004', company_id: 'c0000000-0000-0000-0000-000000000000', key: 'compliance_doc', cardinality: 'multi' }
   ];
 
-  private groupMemberships = [
-    { group_name: 'Engineering', employee_id: 'e0000000-0000-0000-0000-000000000002' }, // Alice
-    { group_name: 'Engineering', employee_id: 'e0000000-0000-0000-0000-000000000003' }, // Bob
-    { group_name: 'Engineering', employee_id: 'e0000000-0000-0000-0000-000000000006' }  // Eve
+  public groupMemberships = [
+    { group_name: 'Engineering', employee_id: 'e0000000-0000-0000-0000-000000000002' },
+    { group_name: 'Engineering', employee_id: 'e0000000-0000-0000-0000-000000000003' },
+    { group_name: 'Engineering', employee_id: 'e0000000-0000-0000-0000-000000000006' }
   ];
 
   private rules = [
@@ -39,12 +39,19 @@ class CompleteMockDatabaseClient implements IDatabase {
 
   async query<T = any>(text: string, params: any[] = []): Promise<T[]> {
     const cleaned = text.replace(/\s+/g, ' ').trim();
-
     if (cleaned.startsWith('SELECT * FROM employees WHERE id =')) {
       return this.employees.filter(e => e.id === params[0]) as any;
     }
     if (cleaned.startsWith('SELECT company_id FROM employees WHERE id =')) {
       return this.employees.filter(e => e.id === params[0]).map(e => ({ company_id: e.company_id })) as any;
+    }
+    if (cleaned.startsWith('SELECT DISTINCT assignable_type_id FROM assignment_rules WHERE active = true AND rule_type = \'group\'')) {
+      const types = this.rules.filter(r => r.rule_type === 'group' && (r.condition as any).group === params[0]).map(r => r.assignable_type_id);
+      return Array.from(new Set(types)).map(id => ({ assignable_type_id: id })) as any;
+    }
+    if (cleaned.startsWith('SELECT DISTINCT assignable_type_id FROM assignment_rules')) {
+      const types = this.rules.filter(r => params[0].includes(r.rule_type)).map(r => r.assignable_type_id);
+      return Array.from(new Set(types)).map(id => ({ assignable_type_id: id })) as any;
     }
     if (cleaned.startsWith('SELECT * FROM assignment_rules WHERE assignable_type_id =')) {
       return this.rules.filter(r => r.assignable_type_id === params[0] && r.active) as any;
@@ -77,91 +84,69 @@ class CompleteMockDatabaseClient implements IDatabase {
     }
     throw new Error(`Unsupported Query: ${cleaned}`);
   }
+
+  // State manipulation mock utilities
+  public updateEmployee(id: string, patch: any) {
+    const emp = this.employees.find(e => e.id === id);
+    if (emp) Object.assign(emp, patch);
+  }
+
+  public removeGroupMembership(employeeId: string, groupName: string) {
+    this.groupMemberships = this.groupMemberships.filter(m => !(m.employee_id === employeeId && m.group_name === groupName));
+  }
 }
 
-async function runValidationSuite() {
+async function runTimelineSimulation() {
   const db = new CompleteMockDatabaseClient();
-  const employeeIds = [
-    { name: 'Eng Lead', id: 'e0000000-0000-0000-0000-000000000001' },
-    { name: 'Alice',    id: 'e0000000-0000-0000-0000-000000000002' },
-    { name: 'Bob',      id: 'e0000000-0000-0000-0000-000000000003' },
-    { name: 'Carol',    id: 'e0000000-0000-0000-0000-000000000004' },
-    { name: 'Dave',      id: 'e0000000-0000-0000-0000-000000000005' },
-    { name: 'Eve',      id: 'e0000000-0000-0000-0000-000000000006' }
-  ];
+  const bobId = 'e0000000-0000-0000-0000-000000000003';
+  const eveId = 'e0000000-0000-0000-0000-000000000006';
 
-  console.log("⚡ Executing Rule Resolution Engine across data population...");
-  for (const emp of employeeIds) {
+  console.log("🚀 Establishing Baseline Positions for Core Team Members...");
+  for (const emp of db.employees) {
     await resolveAllForEmployee(db, emp.id);
   }
 
-  // Identifiers for verification mapping
-  const mgrType  = 'a0000000-0000-0000-0000-000000000001';
-  const vacType  = 'a0000000-0000-0000-0000-000000000002';
-  const appType  = 'a0000000-0000-0000-0000-000000000003';
-  const docType  = 'a0000000-0000-0000-0000-000000000004';
+  console.log("\n=========================================================================");
+  console.log("SCENARIO 1: Bob Relocates from New York (NY) to California (CA)");
+  console.log("=========================================================================");
+  db.updateEmployee(bobId, { work_state: 'CA' });
+  await onEmployeeUpdated(db, bobId, ['work_state']);
 
-  const engLeadTarget  = '30000000-0000-0000-0000-000000000001';
-  const stdVacTarget    = '30000000-0000-0000-0000-000000000002';
-  const snrVacTarget    = '30000000-0000-0000-0000-000000000003';
-  const githubTarget    = '30000000-0000-0000-0000-000000000004';
-  const linearTarget    = '30000000-0000-0000-0000-000000000005';
-  const mealBreakTarget = '30000000-0000-0000-0000-000000000006';
+  const bobDocs = db.assignments.filter(a => a.employee_id === bobId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000004' && a.effective_to === null);
+  console.log(`Verified: Bob now holds active CA compliance targets: ${bobDocs.some(d => d.target_id === '30000000-0000-0000-0000-000000000006')}`);
 
-  const helper = {
-    hasTarget: (empId: string, typeId: string, targetId: string) => 
-      db.assignments.some(a => a.employee_id === empId && a.assignable_type_id === typeId && a.target_id === targetId && a.effective_to === null),
-    getAssignment: (empId: string, typeId: string) => 
-      db.assignments.find(a => a.employee_id === empId && a.assignable_type_id === typeId && a.effective_to === null)
-  };
+  console.log("\n=========================================================================");
+  console.log("SCENARIO 2: Bob Reaches the 2-Year Service Milestone");
+  console.log("=========================================================================");
+  const originalVacation = db.assignments.find(a => a.employee_id === bobId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000002' && a.effective_to === null);
+  console.log(`Baseline Active Vacation Target ID: ${originalVacation?.target_id}`);
 
-  console.log("\n=======================================================");
-  console.log("🔬 VERIFICATION SUITE RESULTS");
-  console.log("=======================================================");
+  // Simulate tenure change by moving the hire date back
+  db.updateEmployee(bobId, { hire_date: '2023-01-01' });
+  await onEmployeeUpdated(db, bobId, ['hire_date']);
 
-  // Assertion 1: Manager Assignments & Overrides
-  const aliceMgr = helper.getAssignment(employeeIds[1].id, mgrType);
-  const bobMgr   = helper.getAssignment(employeeIds[2].id, mgrType);
-  const eveMgr   = helper.getAssignment(employeeIds[5].id, mgrType);
+  const updatedVacations = db.assignments.filter(a => a.employee_id === bobId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000002');
+  const closedVacation = updatedVacations.find(a => a.effective_to !== null);
+  const activeVacation = updatedVacations.find(a => a.effective_to === null);
 
-  console.log(`[PASS] Alice gets Eng Lead via Attribute Rule: ${aliceMgr?.rule_id === '40000000-0000-0000-0000-000000000001' && aliceMgr.source === 'rule'}`);
-  console.log(`[PASS] Bob gets Eng Lead via Attribute Rule: ${bobMgr?.rule_id === '40000000-0000-0000-0000-000000000001' && bobMgr.source === 'rule'}`);
-  console.log(`[PASS] Eve gets Eng Lead via Manual Override: ${eveMgr?.rule_id === '40000000-0000-0000-0000-000000000002' && eveMgr.source === 'manual'}`);
+  console.log(`Verified: Standard Vacation period closed successfully: ${closedVacation?.target_id === '30000000-0000-0000-0000-000000000002'}`);
+  console.log(`Verified: Senior Vacation period opened successfully: ${activeVacation?.target_id === '30000000-0000-0000-0000-000000000003'}`);
 
-  // Assertion 2: Tenure Vacation Splits
-  console.log(`[PASS] Alice (3yr) -> Senior Vacation: ${helper.hasTarget(employeeIds[1].id, vacType, snrVacTarget)}`);
-  console.log(`[PASS] Bob (<1yr) -> Standard Vacation: ${helper.hasTarget(employeeIds[2].id, vacType, stdVacTarget)}`);
+  console.log("\n=========================================================================");
+  console.log("SCENARIO 3: Removing Eve from the Engineering Group");
+  console.log("=========================================================================");
+  const eveAppsBefore = db.assignments.filter(a => a.employee_id === eveId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000003' && a.effective_to === null);
+  console.log(`Active tool accounts prior to group modification: ${eveAppsBefore.length}`);
 
-  // Assertion 3: App Multi-access
-  const engGroupAppsPass = ['e0000000-0000-0000-0000-000000000002', 'e0000000-0000-0000-0000-000000000003', 'e0000000-0000-0000-0000-000000000006'].every(id => 
-    helper.hasTarget(id, appType, githubTarget) && helper.hasTarget(id, appType, linearTarget)
-  );
-  const carolAppsPass = db.assignments.filter(a => a.employee_id === employeeIds[3].id && a.assignable_type_id === appType).length === 0;
-  console.log(`[PASS] Alice/Bob/Eve receive GitHub + Linear: ${engGroupAppsPass}`);
-  console.log(`[PASS] Carol (Sales) receives zero app access configurations: ${carolAppsPass}`);
+  db.removeGroupMembership(eveId, 'Engineering');
+  await onGroupMembershipChanged(db, eveId, 'Engineering');
 
-  // Assertion 4: CA State Mandate Compliance Documents
-  const caDocPass = ['e0000000-0000-0000-0000-000000000001', 'e0000000-0000-0000-0000-000000000002', 'e0000000-0000-0000-0000-000000000005', 'e0000000-0000-0000-0000-000000000006'].every(id =>
-    helper.hasTarget(id, docType, mealBreakTarget)
-  );
-  const nyDocPass = ['e0000000-0000-0000-0000-000000000003', 'e0000000-0000-0000-0000-000000000004'].every(id =>
-    !helper.hasTarget(id, docType, mealBreakTarget)
-  );
-  console.log(`[PASS] EngLead/Alice/Dave/Eve (CA) receive Meal Break Document: ${caDocPass}`);
-  console.log(`[PASS] Bob/Carol (NY) bypass Meal Break Document: ${nyDocPass}`);
-  console.log("=======================================================\n");
-
-  console.log("📋 RAW SYSTEM ASSIGNMENTS TABLE LOG:");
-  console.table(db.assignments.map(a => {
-    const emp = employeeIds.find(e => e.id === a.employee_id);
-    return {
-      Employee: emp?.name,
-      Type: a.assignable_type_id === mgrType ? 'Manager' : a.assignable_type_id === vacType ? 'Vacation' : a.assignable_type_id === appType ? 'App Access' : 'Compliance',
-      Target: a.target_id === engLeadTarget ? 'Eng Lead' : a.target_id === stdVacTarget ? 'Std Vacation' : a.target_id === snrVacTarget ? 'Snr Vacation' : a.target_id === githubTarget ? 'GitHub' : a.target_id === linearTarget ? 'Linear' : 'CA Meal Break',
-      Source: a.source,
-      Rule_Id: a.rule_id ? `${a.rule_id.substring(0,8)}...` : 'NONE'
-    };
-  }));
+  const eveAppsAfter = db.assignments.filter(a => a.employee_id === eveId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000003' && a.effective_to === null);
+  console.log(`Active tool accounts after group modification: ${eveAppsAfter.length}`);
+  
+  const closedEveApps = db.assignments.filter(a => a.employee_id === eveId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000003' && a.effective_to !== null);
+  console.log(`Verified: Both app configurations closed correctly: ${closedEveApps.length === 2}`);
+  console.log("=========================================================================\n");
 }
 
-runValidationSuite().catch(console.error);
+runTimelineSimulation().catch(console.error);
