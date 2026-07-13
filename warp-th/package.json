@@ -13,7 +13,10 @@
   "author": "Sam Meydanshahi",
   "license": "MIT",
   "devDependencies": {
-    "typescript": "^4.0.0",
-    "ts-node": "^10.0.0"
+    "ts-node": "^10.0.0",
+    "typescript": "^4.0.0"
+  },
+  "dependencies": {
+    "pg": "^8.22.0"
   }
 }
