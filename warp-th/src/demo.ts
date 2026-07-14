@@ -1,4 +1,4 @@
-import { IDatabase, resolveAllForEmployee } from './resolver';
+import { explainAssignment, getAssignmentsAsOf, IDatabase, resolveAllForEmployee } from './resolver';
 import { onEmployeeUpdated, onGroupMembershipChanged } from './events';
 
 class CompleteMockDatabaseClient implements IDatabase {
@@ -50,7 +50,8 @@ class CompleteMockDatabaseClient implements IDatabase {
       return Array.from(new Set(types)).map(id => ({ assignable_type_id: id })) as any;
     }
     if (cleaned.startsWith('SELECT DISTINCT assignable_type_id FROM assignment_rules')) {
-      const types = this.rules.filter(r => params[0].includes(r.rule_type)).map(r => r.assignable_type_id);
+      const targetRuleTypes = params[0] as string[];
+      const types = this.rules.filter(r => targetRuleTypes.includes(r.rule_type)).map(r => r.assignable_type_id);
       return Array.from(new Set(types)).map(id => ({ assignable_type_id: id })) as any;
     }
     if (cleaned.startsWith('SELECT * FROM assignment_rules WHERE assignable_type_id =')) {
@@ -65,6 +66,14 @@ class CompleteMockDatabaseClient implements IDatabase {
     }
     if (cleaned.startsWith('SELECT id FROM assignable_types WHERE company_id =')) {
       return this.assignableTypes.filter(t => t.company_id === params[0]).map(t => ({ id: t.id })) as any;
+    }
+    if (cleaned.includes('effective_from <= $2') || cleaned.includes('effective_from <= $3')) {
+      const checkDate = params[1];
+      return this.assignments.filter(a =>
+        a.employee_id === params[0] &&
+        a.effective_from <= checkDate &&
+        (a.effective_to === null || a.effective_to > checkDate)
+      ) as any;
     }
     if (cleaned.startsWith('SELECT * FROM assignments WHERE employee_id =')) {
       return this.assignments.filter(a => a.employee_id === params[0] && a.assignable_type_id === params[1] && a.effective_to === null) as any;
@@ -82,10 +91,15 @@ class CompleteMockDatabaseClient implements IDatabase {
       this.auditLogs.push({ id: params[0], assignment_id: params[1], action: params[2], reason: params[3], rule_id: params[4], snapshot: JSON.parse(params[5]) });
       return [];
     }
+    if (cleaned.startsWith('SELECT * FROM assignment_rules WHERE id =')) {
+      return this.rules.filter(r => r.id === params[0]) as any;
+    }
+    if (cleaned.startsWith('SELECT * FROM assignment_audit_log WHERE assignment_id =')) {
+      return this.auditLogs.filter(a => a.assignment_id === params[0]) as any;
+    }
     throw new Error(`Unsupported Query: ${cleaned}`);
   }
 
-  // State manipulation mock utilities
   public updateEmployee(id: string, patch: any) {
     const emp = this.employees.find(e => e.id === id);
     if (emp) Object.assign(emp, patch);
@@ -101,29 +115,28 @@ async function runTimelineSimulation() {
   const bobId = 'e0000000-0000-0000-0000-000000000003';
   const eveId = 'e0000000-0000-0000-0000-000000000006';
 
-  console.log("🚀 Establishing Baseline Positions for Core Team Members...");
+  console.log("🚀 Establishing Baseline Positions (Baseline: 2026-06-01)...");
   for (const emp of db.employees) {
-    await resolveAllForEmployee(db, emp.id);
+    await resolveAllForEmployee(db, emp.id, '2026-06-01');
   }
 
   console.log("\n=========================================================================");
-  console.log("SCENARIO 1: Bob Relocates from New York (NY) to California (CA)");
+  console.log("SCENARIO 1: Bob Relocates from NY to CA (Effective 2026-06-10)");
   console.log("=========================================================================");
   db.updateEmployee(bobId, { work_state: 'CA' });
-  await onEmployeeUpdated(db, bobId, ['work_state']);
+  await onEmployeeUpdated(db, bobId, ['work_state'], '2026-06-10');
 
   const bobDocs = db.assignments.filter(a => a.employee_id === bobId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000004' && a.effective_to === null);
   console.log(`Verified: Bob now holds active CA compliance targets: ${bobDocs.some(d => d.target_id === '30000000-0000-0000-0000-000000000006')}`);
 
   console.log("\n=========================================================================");
-  console.log("SCENARIO 2: Bob Reaches the 2-Year Service Milestone");
+  console.log("SCENARIO 2: Bob Reaches 2-Year Milestone (Effective 2026-07-01)");
   console.log("=========================================================================");
   const originalVacation = db.assignments.find(a => a.employee_id === bobId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000002' && a.effective_to === null);
   console.log(`Baseline Active Vacation Target ID: ${originalVacation?.target_id}`);
 
-  // Simulate tenure change by moving the hire date back
   db.updateEmployee(bobId, { hire_date: '2023-01-01' });
-  await onEmployeeUpdated(db, bobId, ['hire_date']);
+  await onEmployeeUpdated(db, bobId, ['hire_date'], '2026-07-01');
 
   const updatedVacations = db.assignments.filter(a => a.employee_id === bobId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000002');
   const closedVacation = updatedVacations.find(a => a.effective_to !== null);
@@ -133,19 +146,29 @@ async function runTimelineSimulation() {
   console.log(`Verified: Senior Vacation period opened successfully: ${activeVacation?.target_id === '30000000-0000-0000-0000-000000000003'}`);
 
   console.log("\n=========================================================================");
-  console.log("SCENARIO 3: Removing Eve from the Engineering Group");
+  console.log("SCENARIO 3: Removing Eve from Engineering (Effective 2026-07-10)");
   console.log("=========================================================================");
   const eveAppsBefore = db.assignments.filter(a => a.employee_id === eveId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000003' && a.effective_to === null);
   console.log(`Active tool accounts prior to group modification: ${eveAppsBefore.length}`);
 
   db.removeGroupMembership(eveId, 'Engineering');
-  await onGroupMembershipChanged(db, eveId, 'Engineering');
+  await onGroupMembershipChanged(db, eveId, 'Engineering', '2026-07-10');
 
   const eveAppsAfter = db.assignments.filter(a => a.employee_id === eveId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000003' && a.effective_to === null);
   console.log(`Active tool accounts after group modification: ${eveAppsAfter.length}`);
+
+  console.log("\n=========================================================================");
+  console.log("SCENARIO 4: Point-in-Time Queries");
+  console.log("=========================================================================");
   
-  const closedEveApps = db.assignments.filter(a => a.employee_id === eveId && a.assignable_type_id === 'a0000000-0000-0000-0000-000000000003' && a.effective_to !== null);
-  console.log(`Verified: Both app configurations closed correctly: ${closedEveApps.length === 2}`);
+  const before = await getAssignmentsAsOf(db, bobId, '2026-06-15');
+  const standardVacActive = before.find(a => a.assignable_type_id === 'a0000000-0000-0000-0000-000000000002');
+  console.log("Bob's vacation target as of 2026-06-15:", standardVacActive?.target_id === '30000000-0000-0000-0000-000000000002' ? 'Standard Vacation Policy' : 'None');
+
+  const after = await getAssignmentsAsOf(db, bobId, '2026-07-05');
+  const seniorVacActive = after.find(a => a.assignable_type_id === 'a0000000-0000-0000-0000-000000000002');
+  console.log("Bob's vacation target as of 2026-07-05:", seniorVacActive?.target_id === '30000000-0000-0000-0000-000000000003' ? 'Senior Vacation Policy' : 'None');
+
   console.log("=========================================================================\n");
 }
 

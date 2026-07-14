@@ -3,15 +3,13 @@ import { AssignmentRule } from './types';
 
 /**
  * Handles processing when specific employee core attributes are modified.
- * NOTE: Since tenure calculations depend on the passage of physical time, shifts in tenure
- * are handled here as a change event, but ongoing chronological drift requires a cron-like sweep.
  */
 export async function onEmployeeUpdated(
   db: IDatabase,
   employeeId: string,
-  changedFields: string[]
+  changedFields: string[],
+  asOfDate: string = new Date().toISOString().split('T')[0]
 ): Promise<void> {
-  // Map changed data fields to target rule configurations
   const fieldToRuleTypeMap: Record<string, string> = {
     department: 'attribute',
     work_state: 'location',
@@ -28,7 +26,6 @@ export async function onEmployeeUpdated(
 
   if (targetRuleTypes.size === 0) return;
 
-  // Retrieve rules affected by these field modifications
   const rules = await db.query<AssignmentRule>(
     `SELECT DISTINCT assignable_type_id 
      FROM assignment_rules 
@@ -36,10 +33,9 @@ export async function onEmployeeUpdated(
     [Array.from(targetRuleTypes)]
   );
 
-  // Re-evaluate affected configurations for the employee
   const typeIds = rules.map(r => r.assignable_type_id);
   for (const typeId of typeIds) {
-    await resolveAssignment(db, employeeId, typeId);
+    await resolveAssignment(db, employeeId, typeId, asOfDate);
   }
 }
 
@@ -49,9 +45,9 @@ export async function onEmployeeUpdated(
 export async function onGroupMembershipChanged(
   db: IDatabase,
   employeeId: string,
-  groupName: string
+  groupName: string,
+  asOfDate: string = new Date().toISOString().split('T')[0]
 ): Promise<void> {
-  // Retrieve target rules triggered by this specific group
   const rules = await db.query<AssignmentRule>(
     `SELECT DISTINCT assignable_type_id 
      FROM assignment_rules 
@@ -63,6 +59,6 @@ export async function onGroupMembershipChanged(
 
   const typeIds = rules.map(r => r.assignable_type_id);
   for (const typeId of typeIds) {
-    await resolveAssignment(db, employeeId, typeId);
+    await resolveAssignment(db, employeeId, typeId, asOfDate);
   }
 }

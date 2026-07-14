@@ -16,17 +16,18 @@ export interface IDatabase {
   query: <T = any>(text: string, params?: any[]) => Promise<T[]>;
 }
 
-export function getTenureYears(hireDate: string): number {
+export function getTenureYears(hireDate: string, asOfDate: string = new Date().toISOString().split('T')[0]): number {
   const hire = new Date(hireDate);
-  const now = new Date();
-  const diffInMs = now.getTime() - hire.getTime();
+  const ref = new Date(asOfDate);
+  const diffInMs = ref.getTime() - hire.getTime();
   return diffInMs / (1000 * 60 * 60 * 24 * 365.25);
 }
 
 export async function matchesRule(
   db: IDatabase, 
   employee: Employee, 
-  rule: AssignmentRule
+  rule: AssignmentRule,
+  asOfDate: string = new Date().toISOString().split('T')[0]
 ): Promise<boolean> {
   const cond = rule.condition;
 
@@ -46,7 +47,7 @@ export async function matchesRule(
     }
     case 'tenure': {
       const tenureCond = cond as TenureCondition;
-      const actualTenure = getTenureYears(employee.hire_date);
+      const actualTenure = getTenureYears(employee.hire_date, asOfDate);
       return actualTenure >= tenureCond.tenure_years_gte;
     }
     case 'group': {
@@ -72,7 +73,8 @@ export async function matchesRule(
 export async function getCandidateRules(
   db: IDatabase, 
   employeeId: string, 
-  assignableTypeId: string
+  assignableTypeId: string,
+  asOfDate: string = new Date().toISOString().split('T')[0]
 ): Promise<AssignmentRule[]> {
   const empRows = await db.query<Employee>('SELECT * FROM employees WHERE id = $1', [employeeId]);
   if (empRows.length === 0) throw new Error(`Employee ${employeeId} not found.`);
@@ -85,7 +87,7 @@ export async function getCandidateRules(
 
   const matchedRules: AssignmentRule[] = [];
   for (const rule of ruleRows) {
-    if (await matchesRule(db, employee, rule)) {
+    if (await matchesRule(db, employee, rule, asOfDate)) {
       matchedRules.push(rule);
     }
   }
@@ -98,21 +100,18 @@ export async function getCandidateRules(
   });
 }
 
-/**
- * Reconciles engine assignments with backing system storage states,
- * using clear date ranges for state changes.
- */
 export async function resolveAssignment(
   db: IDatabase, 
   employeeId: string, 
-  assignableTypeId: string
+  assignableTypeId: string,
+  asOfDate: string = new Date().toISOString().split('T')[0]
 ): Promise<void> {
   const typeRows = await db.query<AssignableType>('SELECT * FROM assignable_types WHERE id = $1', [assignableTypeId]);
   if (typeRows.length === 0) throw new Error(`Assignable type ${assignableTypeId} not found.`);
   const { cardinality } = typeRows[0];
 
-  const candidates = await getCandidateRules(db, employeeId, assignableTypeId);
-  const todayStr = new Date().toISOString().split('T')[0];
+  const candidates = await getCandidateRules(db, employeeId, assignableTypeId, asOfDate);
+  const todayStr = asOfDate;
 
   const currentActive = await db.query<Assignment>(
     'SELECT * FROM assignments WHERE employee_id = $1 AND assignable_type_id = $2 AND effective_to IS NULL',
@@ -131,12 +130,10 @@ export async function resolveAssignment(
       return;
     }
 
-    // Optimization: Skip processing if the assigned target is already correct
     if (targetAssignment && targetAssignment.target_id === winningRule.target_id) {
       return;
     }
 
-    // Process target changes: end the current period and start a new one
     if (targetAssignment) {
       await db.query('UPDATE assignments SET effective_to = $1, updated_at = now() WHERE id = $2', [todayStr, targetAssignment.id]);
       await logAudit(db, targetAssignment.id, 'SUPERSEDE', `Superseded by rule ${winningRule.id}`, winningRule.id, candidates);
@@ -151,7 +148,6 @@ export async function resolveAssignment(
     await logAudit(db, newAssignmentId, 'ADD', `Assigned via rule ${winningRule.id}`, winningRule.id, candidates);
 
   } else {
-    // Multi-cardinality resolution: apply changes only where sets differ
     const targetToRuleMap = new Map<string, AssignmentRule>();
     candidates.forEach(rule => {
       if (!targetToRuleMap.has(rule.target_id)) {
@@ -162,7 +158,6 @@ export async function resolveAssignment(
     const targetSet = new Set(targetToRuleMap.keys());
     const currentTargetMap = new Map<string, Assignment>(currentActive.map(a => [a.target_id, a]));
 
-    // 1. Terminate assignments no longer required by the rules
     for (const [targetId, assignment] of currentTargetMap.entries()) {
       if (!targetSet.has(targetId)) {
         await db.query('UPDATE assignments SET effective_to = $1, updated_at = now() WHERE id = $2', [todayStr, assignment.id]);
@@ -170,7 +165,6 @@ export async function resolveAssignment(
       }
     }
 
-    // 2. Add new assignments missing from current active list
     for (const targetId of targetSet.keys()) {
       if (!currentTargetMap.has(targetId)) {
         const winningRule = targetToRuleMap.get(targetId)!;
@@ -186,14 +180,18 @@ export async function resolveAssignment(
   }
 }
 
-export async function resolveAllForEmployee(db: IDatabase, employeeId: string): Promise<void> {
+export async function resolveAllForEmployee(
+  db: IDatabase, 
+  employeeId: string,
+  asOfDate: string = new Date().toISOString().split('T')[0]
+): Promise<void> {
   const empRows = await db.query<Employee>('SELECT company_id FROM employees WHERE id = $1', [employeeId]);
   if (empRows.length === 0) return;
   const { company_id } = empRows[0];
 
   const types = await db.query<AssignableType>('SELECT id FROM assignable_types WHERE company_id = $1', [company_id]);
   for (const type of types) {
-    await resolveAssignment(db, employeeId, type.id);
+    await resolveAssignment(db, employeeId, type.id, asOfDate);
   }
 }
 
@@ -215,4 +213,50 @@ async function logAudit(
      VALUES ($1, $2, $3, $4, $5, $6)`,
     [crypto.randomUUID(), assignmentId, action, reason, winningRuleId, JSON.stringify(snapshot)]
   );
+}
+
+export async function getAssignmentsAsOf(
+  db: IDatabase,
+  employeeId: string,
+  asOfDate: string
+): Promise<Assignment[]> {
+  return db.query<Assignment>(
+    `SELECT * FROM assignments
+     WHERE employee_id = $1
+       AND effective_from <= $2
+       AND (effective_to IS NULL OR effective_to > $2)`,
+    [employeeId, asOfDate]
+  );
+}
+
+export async function explainAssignment(
+  db: IDatabase,
+  employeeId: string,
+  assignableTypeId: string,
+  asOfDate: string
+): Promise<{ assignment: Assignment; rule: AssignmentRule | null; audit: any } | null> {
+  const rows = await db.query<Assignment>(
+    `SELECT * FROM assignments
+     WHERE employee_id = $1 AND assignable_type_id = $2
+       AND effective_from <= $3
+       AND (effective_to IS NULL OR effective_to > $3)`,
+    [employeeId, assignableTypeId, asOfDate]
+  );
+  if (rows.length === 0) return null;
+  const assignment = rows[0];
+
+  const ruleRows = assignment.rule_id
+    ? await db.query<AssignmentRule>('SELECT * FROM assignment_rules WHERE id = $1', [assignment.rule_id])
+    : [];
+
+  const auditRows = await db.query<any>(
+    'SELECT * FROM assignment_audit_log WHERE assignment_id = $1 ORDER BY created_at DESC LIMIT 1',
+    [assignment.id]
+  );
+
+  return {
+    assignment,
+    rule: ruleRows[0] || null,
+    audit: auditRows[0] || null,
+  };
 }
