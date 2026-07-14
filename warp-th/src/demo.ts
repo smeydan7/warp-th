@@ -169,6 +169,17 @@ async function runTimelineSimulation() {
   const seniorVacActive = after.find(a => a.assignable_type_id === 'a0000000-0000-0000-0000-000000000002');
   console.log("Bob's vacation target as of 2026-07-05:", seniorVacActive?.target_id === '30000000-0000-0000-0000-000000000003' ? 'Senior Vacation Policy' : 'None');
 
+  const eveManagerExplanation = await explainAssignment(
+    db,
+    eveId,
+    'a0000000-0000-0000-0000-000000000001',
+    '2026-07-10'
+  );
+  console.log(
+    "Eve's manager assignment as of 2026-07-10:",
+    eveManagerExplanation?.rule?.rule_type === 'manual' ? 'Manual override applied' : 'No manual override found'
+  );
+
   console.log("=========================================================================\n");
 }
 

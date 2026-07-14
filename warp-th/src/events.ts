@@ -3,6 +3,10 @@ import { AssignmentRule } from './types';
 
 /**
  * Handles processing when specific employee core attributes are modified.
+ *
+ * A future rule-edit hook (for example, onRuleChanged(ruleId)) would need to
+ * re-resolve all employees affected by that rule's assignable type. That is
+ * intentionally left as a follow-up because it can be expensive at scale.
  */
 export async function onEmployeeUpdated(
   db: IDatabase,
@@ -29,7 +33,7 @@ export async function onEmployeeUpdated(
   const rules = await db.query<AssignmentRule>(
     `SELECT DISTINCT assignable_type_id 
      FROM assignment_rules 
-     WHERE active = true AND rule_type ANY($1)`,
+     WHERE active = true AND rule_type = ANY($1)`,
     [Array.from(targetRuleTypes)]
   );
 
