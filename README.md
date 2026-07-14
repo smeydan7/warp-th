@@ -1,107 +1,88 @@
 # Policy Assignment System
 
-A generic engine for assigning "things" to employees based on rules; time off policies, managers, app access, compliance documents, and anything else that follows the same pattern. Built for the Warp take-home.
+A generic engine for resolving employee assignments (managers, time-off policies, app access, compliance documents, etc.) based on rules. Instead of building a separate schema for each assignment type, this system models them all through one shape: assignable types, targets, rules, and assignments.
 
-## Running the Project
+## Quick Start
 
-Clone the repo and install dependencies:
+### Prerequisites
+- Node.js 18+
+- PostgreSQL running locally (or accessible via connection string)
 
+### Setup
+
+1. Clone the repo and install dependencies:
 ```bash
 cd warp-th
 npm install
 ```
 
-Copy the env file and adjust if needed:
-
-```bash
-cp .env.example .env
-```
-
-If you don't have a Postgres database running yet, see the setup section below first.
-
-Once your database is set up and seeded, run the resolver against a real employee:
-
-```bash
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/warp_th \
-SAMPLE_EMPLOYEE_ID=e0000000-0000-0000-0000-000000000001 \
-npx ts-node src/index.ts
-```
-
-If you leave `DATABASE_URL` unset, `index.ts` falls back to an in-memory demo simulation instead, so you can see the whole system working without touching Postgres at all:
-
-```bash
-npx ts-node src/demo.ts
-```
-
-This runs through four scenarios: an employee relocating, an employee crossing a tenure threshold, a group membership change, and a couple of point-in-time / audit queries. Everything prints to the console so you can follow along.
-
-To run the unit tests:
-
-```bash
-node --test tests/
-```
-
-## Setting Up the Database
-
-You need a local Postgres instance. If you don't have one:
-
-```bash
-brew install --cask postgres-app
-```
-
-Open the app once to initialize it, then create the database:
-
+2. Create the database:
 ```bash
 createdb warp_th
 ```
 
-Load the schema:
-
+3. Load the schema and seed data:
 ```bash
 psql postgresql://postgres:postgres@localhost:5432/warp_th -f src/db/schema.sql
-```
-
-Load the seed data (six sample employees, a couple of groups, and rules covering every rule type):
-
-```bash
 psql postgresql://postgres:postgres@localhost:5432/warp_th -f src/db/seed.sql
 ```
 
-At this point you can run `src/index.ts` against real data, or just poke around with `psql` directly.
+4. Copy the environment example and adjust if your local Postgres uses different credentials:
+```bash
+cp .env.example .env
+```
+
+### Running
+
+**Demo simulation (no database needed):**
+```bash
+npx ts-node src/index.ts
+```
+If `DATABASE_URL` isn't set, this runs a full in-memory simulation covering rule resolution, event-driven re-resolution, and point-in-time queries, and prints the results to the console.
+
+**Resolve a real employee against Postgres:**
+```bash
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/warp_th SAMPLE_EMPLOYEE_ID=e0000000-0000-0000-0000-000000000001 npx ts-node src/index.ts
+```
+This connects to your seeded database and runs the resolver for the given employee, writing real rows into the `assignments` table.
 
 ## Architecture
 
-The core idea is that almost every assignment feature (manager, time off policy, app access, compliance docs, and so on) is the same shape underneath: an employee gets matched to a target based on rules, and either has exactly one active target (single cardinality) or several at once (multi cardinality). Rather than building a separate schema per feature, there's one generic model that covers all of them.
+### The core idea
 
-**Tables:**
+Almost every feature in this domain reduces to the same pattern: an employee gets assigned to something based on rules. Rather than building a `manager_assignments` table, a `time_off_assignments` table, an `app_access` table, and so on, this system uses one generic model that can express all of them.
 
-- `employees`, `groups`, `group_memberships` are the inputs. In a real system these would come from the Employee Service and Directory Service; here they're modeled directly for the demo.
-- `assignable_types` defines the categories of things that get assigned (manager, time_off_vacation, app_access, compliance_doc) and whether each one is single or multi cardinality.
-- `targets` is the generic "thing being assigned." An app, a policy, a document, or even another employee (for manager assignments) are all just rows here.
-- `assignment_rules` defines how targets get matched to employees. Each rule has a type (attribute, location, tenure, group, or manual), a JSON condition, a target, and a priority.
-- `assignments` is the resolved output. Rows are never updated in place; when an assignment changes, the old row gets an `effective_to` date and a new row gets inserted with a fresh `effective_from`. This gives you a full history for free and lets you answer point-in-time questions.
-- `assignment_audit_log` records which rule won and which candidates lost every time an assignment changes, so you can explain why an employee has a given assignment as of any date.
+### Tables
 
-**Resolution:**
+- **employees** - the population rules are evaluated against (department, location, tenure, employment type, etc.)
+- **groups / group_memberships** - IAM-style group membership, used by group-based rules
+- **assignable_types** - defines a category of assignment (manager, time_off_vacation, app_access, compliance_doc) and its cardinality, either `single` (one active assignment per employee) or `multi` (many allowed at once)
+- **targets** - the actual "thing" being assigned (a specific manager, a vacation policy, an app, a document)
+- **assignment_rules** - the logic that decides who gets what. Each rule has a `rule_type` (attribute, location, tenure, group, or manual), a JSON condition, a target, and a priority
+- **assignments** - the resolved output. One row per active employee-to-target assignment, with `effective_from` and `effective_to` dates so history is preserved rather than overwritten
+- **assignment_audit_log** - records which rule won and which rules lost for every assignment change, so you can answer "why does this employee have this assignment"
 
-For a given employee and assignable type, the resolver pulls every active rule for that type, checks which ones match the employee (based on their attributes, location, tenure, group memberships, or a direct manual override), and sorts the matches by priority. Manual rules use priority 100 so they always win over everything else. Ties are broken by which rule was created first, so the outcome is always deterministic and repeatable.
+### How resolution works
 
-For single cardinality types, the highest priority match wins and becomes the one active assignment. For multi cardinality types, every matching target becomes an active assignment, and the resolver diffs against what's currently active, closing anything that no longer matches and adding anything new.
+For a given employee and assignable type, the resolver:
+1. Loads the employee's attributes
+2. Fetches all active rules for that assignable type
+3. Checks which rules match (attribute equality, location match, tenure threshold, group membership, or a manual override tied to a specific employee)
+4. Sorts matches by priority (manual overrides use priority 100 so they naturally win ties against automated rules), then by rule creation time as a tiebreaker
+5. For `single` cardinality types, the top match wins and becomes the one active assignment
+6. For `multi` cardinality types, all matches are applied and the current set is diffed against what is already active
 
-**Re-resolution:**
+Assignment rows are never updated in place. When a winning target changes, the old row gets an `effective_to` date and a new row is inserted. This means you can ask "what did this employee have as of a given date" just by querying with a date range, and the audit log tells you which rule was responsible.
 
-The system reacts to three kinds of events: an employee's attributes changing, a group membership changing, and (as a documented but not yet implemented follow-up) a rule being edited. Rather than re-checking every employee against every rule, the event handlers map the changed field to the relevant rule types and only re-resolve the assignable types those rule types affect. Tenure is the one exception: since nothing "fires" when time simply passes, a real deployment would need a scheduled job to periodically re-check tenure-based rules.
+### Re-resolution
 
-**Known limitations:**
+The system reacts to three kinds of changes:
+- An employee's attributes change (location, department, hire date) - only assignable types with rules referencing the changed field get re-resolved, not every rule for every employee
+- A group's membership changes - only assignable types with rules for that specific group are re-resolved
+- A rule is edited - not implemented here, left as a documented tradeoff since re-resolving every employee affected by a changed rule gets expensive at scale, and is worth discussing separately
 
-- Tenure-based rules need a scheduled re-check since there's no natural event tied to time passing on its own.
-- Re-resolution on rule edits is not implemented, only sketched out in `events.ts`, since re-resolving every employee affected by a changed rule can get expensive at scale.
-- The demo defaults to an in-memory mock database for reproducibility. The resolver has also been run and verified against a real Postgres instance (see the assignments table output above the architecture section, or run it yourself with `src/index.ts`).
-- Rules currently don't exclude an employee from being their own target. In the seed data, the Engineering department lead ends up assigned as his own manager, since the attribute rule matches everyone in Engineering including him. A production system would probably want a guard against this or handle leadership roles through manual overrides.
+### Known limitations
 
-**Bonus tradeoffs (discussion only, not implemented):**
-
-- *Event-driven workflows*: this resolver answers "what applies to this employee right now." A separate workflow engine would sit on top and answer "what should happen when that changes," subscribing to assignment-change events rather than being baked into the resolver itself.
-- *Simulation*: a dry-run flag on `resolveAssignment` could return the diff of a hypothetical rule change without writing anything, reusing the same resolution logic.
-- *Scale*: at 100k+ employees, indexing rules by the attribute keys they reference and only re-resolving the employees whose changed field intersects those keys avoids a full employee times rules scan. Group membership changes affecting many employees at once would benefit from batching through a queue.
-- *Exceptions and approvals*: these could be modeled as another `source` value on assignments (`exception`), with an `expires_at` and an approval status, layered on top of the normal rule resolution as an override.
+- Tenure-based rules depend on the passage of time, not an external event, so there is no natural trigger to re-check them. In a real system this would need a scheduled job.
+- The seed rule that assigns a manager by department does not exclude the target employee from matching their own rule, so a manager can end up assigned to themselves. This is a minor seed data quirk rather than a resolver bug, but worth guarding against with a real rule set.
+- Rule edits do not currently trigger re-resolution (see above).
